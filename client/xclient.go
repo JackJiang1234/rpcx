@@ -93,6 +93,8 @@ type xClient struct {
 	unstableServers map[string]time.Time // 一些服务器重启，如果和它们建立链接，可能会耗费非常长的时间，这里记录袭来需要临时屏蔽
 	discovery       ServiceDiscovery
 	selector        Selector
+	stickyRPCClient RPCClient
+	stickyK         string
 
 	slGroup singleflight.Group
 
@@ -243,6 +245,11 @@ func filterByStateAndGroup(group string, servers map[string]string) {
 // selects a client from candidates base on c.selectMode
 func (c *xClient) selectClient(ctx context.Context, servicePath, serviceMethod string, args interface{}) (string, RPCClient, error) {
 	c.mu.Lock()
+	if c.option.Sticky && c.stickyRPCClient != nil {
+		c.mu.Unlock()
+		return c.stickyK, c.stickyRPCClient, nil
+	}
+
 	fn := c.selector.Select
 	if c.Plugins != nil {
 		fn = c.Plugins.DoWrapSelect(fn)
@@ -256,11 +263,10 @@ func (c *xClient) selectClient(ctx context.Context, servicePath, serviceMethod s
 
 	client, err := c.getCachedClient(k, servicePath, serviceMethod, args)
 
-	// if err != nil {
-	// 	c.mu.Lock()
-	// 	c.unstableServers[k] = time.Now() // 此服务器有问题，暂时屏蔽
-	// 	c.mu.Unlock()
-	// }
+	if c.option.Sticky && client != nil {
+		c.stickyK = k
+		c.stickyRPCClient = client
+	}
 
 	return k, client, err
 }
@@ -361,6 +367,11 @@ func (c *xClient) deleteCachedClient(client RPCClient, k, servicePath, serviceMe
 
 func (c *xClient) removeClient(k, servicePath, serviceMethod string, client RPCClient) {
 	c.mu.Lock()
+	if c.option.Sticky {
+		c.stickyK = ""
+		c.stickyRPCClient = nil
+	}
+
 	cl := c.findCachedClient(k, servicePath, serviceMethod)
 	if cl == client {
 		c.deleteCachedClient(client, k, servicePath, serviceMethod)
@@ -488,6 +499,11 @@ func (c *xClient) Go(ctx context.Context, serviceMethod string, args interface{}
 	if share.Trace {
 		log.Debugf("selected a client %s for %s.%s, args: %+v in case of xclient Go", client.RemoteAddr(), c.servicePath, serviceMethod, args)
 	}
+
+	if done == nil {
+		done = make(chan *Call, 10)
+	}
+
 	return client.Go(ctx, c.servicePath, serviceMethod, args, reply, done), nil
 }
 
@@ -655,9 +671,36 @@ func (c *xClient) Call(ctx context.Context, serviceMethod string, args interface
 
 // Oneshot invokes the named function, ** DOEST NOT ** wait for it to complete, and returns immediately.
 func (c *xClient) Oneshot(ctx context.Context, serviceMethod string, args interface{}) error {
-	_, err := c.Go(ctx, serviceMethod, args, nil, nil)
+	if c.isShutdown {
+		return ErrXClientShutdown
+	}
 
-	return err
+	if c.auth != "" {
+		metadata := ctx.Value(share.ReqMetaDataKey)
+		if metadata == nil {
+			metadata = map[string]string{}
+			ctx = context.WithValue(ctx, share.ReqMetaDataKey, metadata)
+		}
+		m := metadata.(map[string]string)
+		m[share.AuthKey] = c.auth
+	}
+
+	ctx = setServerTimeout(ctx)
+
+	if share.Trace {
+		log.Debugf("select a client for %s.%s, args: %+v in case of xclient Go", c.servicePath, serviceMethod, args)
+	}
+	_, client, err := c.selectClient(ctx, c.servicePath, serviceMethod, args)
+	if err != nil {
+		return err
+	}
+	if share.Trace {
+		log.Debugf("selected a client %s for %s.%s, args: %+v in case of xclient Go", client.RemoteAddr(), c.servicePath, serviceMethod, args)
+	}
+
+	client.Go(ctx, c.servicePath, serviceMethod, args, nil, nil)
+
+	return nil
 }
 
 func uncoverError(err error) bool {
