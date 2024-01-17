@@ -20,6 +20,7 @@ import (
 	"github.com/smallnest/rpcx/share"
 )
 
+/* 定义rpcx协议字段的常量名称*/
 const (
 	XVersion           = "X-RPCX-Version"
 	XMessageType       = "X-RPCX-MesssageType"
